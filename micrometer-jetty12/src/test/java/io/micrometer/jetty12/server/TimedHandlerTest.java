@@ -16,15 +16,20 @@
 package io.micrometer.jetty12.server;
 
 import io.micrometer.core.Issue;
+import io.micrometer.core.instrument.DistributionSummary;
 import io.micrometer.core.instrument.MeterRegistry;
 import io.micrometer.core.instrument.MockClock;
 import io.micrometer.core.instrument.Tags;
 import io.micrometer.core.instrument.binder.http.Outcome;
 import io.micrometer.core.instrument.simple.SimpleConfig;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
+import org.eclipse.jetty.compression.gzip.GzipCompression;
+import org.eclipse.jetty.compression.server.CompressionHandler;
 import org.eclipse.jetty.http.HttpFields;
+import org.eclipse.jetty.http.HttpHeader;
 import org.eclipse.jetty.http.HttpStatus;
 import org.eclipse.jetty.http.HttpTester;
+import org.eclipse.jetty.io.Content;
 import org.eclipse.jetty.server.*;
 import org.eclipse.jetty.util.BufferUtil;
 import org.eclipse.jetty.util.Callback;
@@ -33,6 +38,8 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.CyclicBarrier;
 import java.util.concurrent.Future;
@@ -374,6 +381,173 @@ class TimedHandlerTest {
         }
     }
 
+    @Test
+    void bodySizesAreNotRecordedByDefault() throws Exception {
+        timedHandler.setHandler(new EchoHandler());
+        server.start();
+
+        HttpTester.Response response = HttpTester.parseResponse(
+                connector.getResponse("POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\n\r\nhello"));
+        assertThat(response.getStatus()).isEqualTo(HttpStatus.OK_200);
+        assertThat(timedHandler.awaitOnComplete(5, TimeUnit.SECONDS)).isTrue();
+
+        assertThat(registry.find("jetty.server.request.size").summary()).isNull();
+        assertThat(registry.find("jetty.server.response.size").summary()).isNull();
+    }
+
+    @Test
+    void bodySizesAreRecordedForFixedLengthExchange() throws Exception {
+        recordBodySizes();
+        timedHandler.setHandler(new EchoHandler());
+        server.start();
+
+        HttpTester.Response response = HttpTester.parseResponse(
+                connector.getResponse("POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 11\r\n\r\nhello world"));
+        assertThat(response.getStatus()).isEqualTo(HttpStatus.OK_200);
+        assertThat(response.getContent()).isEqualTo("hello world");
+        assertThat(response.get(HttpHeader.CONTENT_LENGTH)).isEqualTo("11");
+        assertThat(timedHandler.awaitOnComplete(5, TimeUnit.SECONDS)).isTrue();
+
+        DistributionSummary requestSize = registry.get("jetty.server.request.size")
+            .tag("method", "POST")
+            .tag("status", "200")
+            .tag("outcome", Outcome.SUCCESS.name())
+            .summary();
+        assertThat(requestSize.getId().getBaseUnit()).isEqualTo("bytes");
+        assertThat(requestSize.count()).isEqualTo(1);
+        assertThat(requestSize.totalAmount()).isEqualTo(11);
+
+        DistributionSummary responseSize = registry.get("jetty.server.response.size")
+            .tag("method", "POST")
+            .tag("status", "200")
+            .tag("outcome", Outcome.SUCCESS.name())
+            .summary();
+        assertThat(responseSize.getId().getBaseUnit()).isEqualTo("bytes");
+        assertThat(responseSize.count()).isEqualTo(1);
+        assertThat(responseSize.totalAmount()).isEqualTo(11);
+    }
+
+    @Test
+    void bodySizesExcludeChunkedFraming() throws Exception {
+        recordBodySizes();
+        timedHandler.setHandler(new Handler.Abstract() {
+            @Override
+            public boolean handle(Request request, Response response, Callback callback) throws IOException {
+                Content.Source.asString(request, StandardCharsets.UTF_8);
+                response.setStatus(200);
+                response.write(false, BufferUtil.toBuffer("first "), Callback
+                    .from(() -> response.write(true, BufferUtil.toBuffer("second"), callback), callback::failed));
+                return true;
+            }
+        });
+        server.start();
+
+        HttpTester.Response response = HttpTester.parseResponse(
+                connector.getResponse("POST / HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n"
+                        + "5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n"));
+        assertThat(response.getStatus()).isEqualTo(HttpStatus.OK_200);
+        assertThat(response.get(HttpHeader.TRANSFER_ENCODING)).isEqualTo("chunked");
+        assertThat(response.getContent()).isEqualTo("first second");
+        assertThat(timedHandler.awaitOnComplete(5, TimeUnit.SECONDS)).isTrue();
+
+        assertThat(registry.get("jetty.server.request.size").summary().totalAmount()).isEqualTo(11);
+        assertThat(registry.get("jetty.server.response.size").summary().totalAmount()).isEqualTo(12);
+    }
+
+    @Test
+    void bodySizesAreRecordedForEmptyExchange() throws Exception {
+        recordBodySizes();
+        timedHandler.setHandler(new EchoHandler());
+        server.start();
+
+        HttpTester.Response response = HttpTester
+            .parseResponse(connector.getResponse("GET / HTTP/1.1\r\nHost: localhost\r\n\r\n"));
+        assertThat(response.getStatus()).isEqualTo(HttpStatus.OK_200);
+        assertThat(response.getContent()).isEmpty();
+        assertThat(timedHandler.awaitOnComplete(5, TimeUnit.SECONDS)).isTrue();
+
+        DistributionSummary requestSize = registry.get("jetty.server.request.size").tag("method", "GET").summary();
+        assertThat(requestSize.count()).isEqualTo(1);
+        assertThat(requestSize.totalAmount()).isZero();
+        DistributionSummary responseSize = registry.get("jetty.server.response.size").tag("method", "GET").summary();
+        assertThat(responseSize.count()).isEqualTo(1);
+        assertThat(responseSize.totalAmount()).isZero();
+    }
+
+    @Test
+    void bodySizesAreRecordedWhenResponseFailsAfterCommit() throws Exception {
+        recordBodySizes();
+        timedHandler.setHandler(new Handler.Abstract() {
+            @Override
+            public boolean handle(Request request, Response response, Callback callback) {
+                response.setStatus(200);
+                response.write(false, BufferUtil.toBuffer("partial"),
+                        Callback.from(() -> callback.failed(new IOException("simulated failure")), callback::failed));
+                return true;
+            }
+        });
+        server.start();
+
+        try (LocalConnector.LocalEndPoint endpoint = connector.connect()) {
+            endpoint.addInputAndExecute("GET / HTTP/1.1\r\nHost: localhost\r\n\r\n");
+            assertThat(timedHandler.awaitOnComplete(5, TimeUnit.SECONDS)).isTrue();
+        }
+
+        DistributionSummary requestSize = registry.get("jetty.server.request.size").tag("method", "GET").summary();
+        assertThat(requestSize.count()).isEqualTo(1);
+        assertThat(requestSize.totalAmount()).isZero();
+        DistributionSummary responseSize = registry.get("jetty.server.response.size").tag("method", "GET").summary();
+        assertThat(responseSize.count()).isEqualTo(1);
+        assertThat(responseSize.totalAmount()).isEqualTo(7);
+    }
+
+    @Test
+    void responseSizeIsCompressedSizeWhenCompressionHandlerIsInside() throws Exception {
+        recordBodySizes();
+        String body = "micrometer ".repeat(200);
+        CompressionHandler compressionHandler = new CompressionHandler();
+        compressionHandler.putCompression(new GzipCompression());
+        compressionHandler.setHandler(new Handler.Abstract() {
+            @Override
+            public boolean handle(Request request, Response response, Callback callback) {
+                response.setStatus(200);
+                response.getHeaders().put(HttpHeader.CONTENT_TYPE, "text/plain");
+                response.write(true, BufferUtil.toBuffer(body), callback);
+                return true;
+            }
+        });
+        timedHandler.setHandler(compressionHandler);
+        server.start();
+
+        HttpTester.Response response = HttpTester
+            .parseResponse(connector.getResponse("GET / HTTP/1.1\r\nHost: localhost\r\nAccept-Encoding: gzip\r\n\r\n"));
+        assertThat(response.getStatus()).isEqualTo(HttpStatus.OK_200);
+        assertThat(response.get(HttpHeader.CONTENT_ENCODING)).isEqualTo("gzip");
+        assertThat(timedHandler.awaitOnComplete(5, TimeUnit.SECONDS)).isTrue();
+
+        double responseSize = registry.get("jetty.server.response.size").summary().totalAmount();
+        assertThat(responseSize).isEqualTo(response.getContentBytes().length);
+        assertThat(responseSize).isLessThan(body.length());
+    }
+
+    private void recordBodySizes() {
+        this.timedHandler = new TestableTimedHandler(registry, Tags.empty(), true);
+        latchHandler.setHandler(timedHandler);
+    }
+
+    private static class EchoHandler extends Handler.Abstract {
+
+        @Override
+        public boolean handle(Request request, Response response, Callback callback) throws IOException {
+            String content = Content.Source.asString(request, StandardCharsets.UTF_8);
+            response.setStatus(200);
+            response.getHeaders().put(HttpHeader.CONTENT_LENGTH, content.length());
+            response.write(true, BufferUtil.toBuffer(content), callback);
+            return true;
+        }
+
+    }
+
     private static class LatchHandler extends Handler.Wrapper {
 
         private volatile CountDownLatch latch = new CountDownLatch(1);
@@ -404,6 +578,10 @@ class TimedHandlerTest {
 
         TestableTimedHandler(MeterRegistry registry, Tags tags) {
             super(registry, tags);
+        }
+
+        TestableTimedHandler(MeterRegistry registry, Tags tags, boolean recordBodySizes) {
+            super(registry, tags, new DefaultJettyCoreRequestTagsProvider(), recordBodySizes);
         }
 
         @Override

@@ -134,6 +134,8 @@ jaxbApi = { module = "javax.xml.bind:jaxb-api", version.ref = "jaxb" }
 jcstressCore = { module = "org.openjdk.jcstress:jcstress-core", version = "0.16" }
 jetty12Server = { module = "org.eclipse.jetty:jetty-server", version.ref = "jetty12" }
 jetty12Client = { module = "org.eclipse.jetty:jetty-client", version.ref = "jetty12" }
+jetty12CompressionGzip = { module = "org.eclipse.jetty.compression:jetty-compression-gzip", version.ref = "jetty12" }
+jetty12CompressionServer = { module = "org.eclipse.jetty.compression:jetty-compression-server", version.ref = "jetty12" }
 jersey2Server = { module = "org.glassfish.jersey.core:jersey-server", version.ref = "jersey2" }
 jersey2Hk2 = { module = "org.glassfish.jersey.inject:jersey-hk2", version.ref = "jersey2" }
 jersey2TestFrameworkInmemory = { module = "org.glassfish.jersey.test-framework.providers:jersey-test-framework-provider-inmemory", version.ref = "jersey2" }

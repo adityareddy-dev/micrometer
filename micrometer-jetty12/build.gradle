@@ -16,6 +16,8 @@ dependencies {
     testImplementation project(":micrometer-observation-test")
     testImplementation project(":micrometer-test")
 
+    testImplementation libs.jetty12CompressionServer
+    testImplementation libs.jetty12CompressionGzip
     testImplementation libs.httpcomponents.client
     testImplementation libs.awaitility
     testImplementation libs.mockitoCore5

@@ -35,6 +35,21 @@ HttpClient httpClient = new HttpClient();
 httpClient.addBean(new JettyConnectionMetrics(registry));
 ----
 
+For Jetty 12, `TimedHandler` from `micrometer-jetty12` times the requests a `Server` handles.
+It can also record request and response body sizes, as follows:
+
+[source,java]
+----
+TimedHandler timedHandler = new TimedHandler(registry, Tags.empty(), new DefaultJettyCoreRequestTagsProvider(), true); //<1>
+timedHandler.setHandler(applicationHandler);
+server.setHandler(timedHandler);
+----
+<1> `true` records `jetty.server.request.size` and `jetty.server.response.size`, which are off by default
+
+The body sizes count the bytes read and written through `TimedHandler`, so headers and chunked framing are not included.
+If a compressing handler such as `CompressionHandler` sits between `TimedHandler` and the application, the response size is the compressed size.
+Request body bytes that the application never reads are not counted.
+
 == Jersey
 
 Micrometer also supports binding metrics to Jersey through `ApplicationEventListener`.

@@ -15,21 +15,34 @@
  */
 package io.micrometer.jetty12.server;
 
+import io.micrometer.core.instrument.DistributionSummary;
 import io.micrometer.core.instrument.LongTaskTimer;
 import io.micrometer.core.instrument.MeterRegistry;
 import io.micrometer.core.instrument.Tag;
 import io.micrometer.core.instrument.Timer;
+import io.micrometer.core.instrument.binder.BaseUnits;
 import org.eclipse.jetty.http.HttpFields;
+import org.eclipse.jetty.io.Content;
 import org.eclipse.jetty.server.Request;
 import org.eclipse.jetty.server.Response;
 import org.eclipse.jetty.server.handler.EventsHandler;
 import org.eclipse.jetty.util.Callback;
 import org.eclipse.jetty.util.component.Graceful;
+import org.jspecify.annotations.Nullable;
 
+import java.nio.ByteBuffer;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * Jetty 12 Server Metrics Handler. The implementation requires at least Jetty 12.0.8.
+ * <p>
+ * Request and response body sizes can optionally be recorded as
+ * {@code jetty.server.request.size} and {@code jetty.server.response.size}. These count
+ * the body bytes read and written through this handler, so they do not include headers or
+ * framing, and they reflect compression only if a compressing handler sits between this
+ * handler and the application. Request body bytes that the application never reads are
+ * not counted.
  *
  * @author Jon Schneider
  * @author Joakim Erdfelt
@@ -43,6 +56,8 @@ public class TimedHandler extends EventsHandler implements Graceful {
 
     private static final String SAMPLE_HANDLER_LONG_TASK_TIMER_ATTRIBUTE = "__micrometer_handler_ltt_sample";
 
+    private static final String BODY_SIZES_ATTRIBUTE = "__micrometer_body_sizes";
+
     protected static final String RESPONSE_STATUS_ATTRIBUTE = "__micrometer_jetty_core_response_status";
 
     private final MeterRegistry registry;
@@ -50,6 +65,8 @@ public class TimedHandler extends EventsHandler implements Graceful {
     private final Iterable<Tag> tags;
 
     private final JettyCoreRequestTagsProvider tagsProvider;
+
+    private final boolean recordBodySizes;
 
     private final Shutdown shutdown = new Shutdown(this) {
         @Override
@@ -73,9 +90,24 @@ public class TimedHandler extends EventsHandler implements Graceful {
     }
 
     public TimedHandler(MeterRegistry registry, Iterable<Tag> tags, JettyCoreRequestTagsProvider tagsProvider) {
+        this(registry, tags, tagsProvider, false);
+    }
+
+    /**
+     * Create a {@code TimedHandler} that can also record request and response body sizes.
+     * @param registry registry to register the meters with
+     * @param tags tags to add to every meter
+     * @param tagsProvider provider of the request tags
+     * @param recordBodySizes whether to record {@code jetty.server.request.size} and
+     * {@code jetty.server.response.size}
+     * @since 1.18.0
+     */
+    public TimedHandler(MeterRegistry registry, Iterable<Tag> tags, JettyCoreRequestTagsProvider tagsProvider,
+            boolean recordBodySizes) {
         this.registry = registry;
         this.tags = tags;
         this.tagsProvider = tagsProvider;
+        this.recordBodySizes = recordBodySizes;
 
         this.timerRequest = LongTaskTimer.builder("jetty.server.requests.open")
             .description("Jetty requests that are currently in progress")
@@ -92,7 +124,21 @@ public class TimedHandler extends EventsHandler implements Graceful {
     protected void onBeforeHandling(Request request) {
         beginRequestTiming(request);
         beginHandlerTiming(request);
+        if (recordBodySizes) {
+            request.setAttribute(BODY_SIZES_ATTRIBUTE, new BodySizes());
+        }
         super.onBeforeHandling(request);
+    }
+
+    @Override
+    protected void onRequestRead(Request request, Content.@Nullable Chunk chunk) {
+        if (recordBodySizes && chunk != null) {
+            BodySizes bodySizes = getBodySizes(request);
+            if (bodySizes != null) {
+                bodySizes.requestBytes.addAndGet(chunk.remaining());
+            }
+        }
+        super.onRequestRead(request, chunk);
     }
 
     @Override
@@ -107,10 +153,50 @@ public class TimedHandler extends EventsHandler implements Graceful {
     }
 
     @Override
+    protected void onResponseWrite(Request request, boolean last, @Nullable ByteBuffer content) {
+        if (recordBodySizes && content != null) {
+            BodySizes bodySizes = getBodySizes(request);
+            if (bodySizes != null) {
+                bodySizes.responseBytes.addAndGet(content.remaining());
+            }
+        }
+        super.onResponseWrite(request, last, content);
+    }
+
+    @Override
     protected void onComplete(Request request, int status, HttpFields headers, Throwable failure) {
         request.setAttribute(RESPONSE_STATUS_ATTRIBUTE, status);
+        recordBodySizes(request);
         stopRequestTiming(request);
         super.onComplete(request, status, headers, failure);
+    }
+
+    private void recordBodySizes(Request request) {
+        BodySizes bodySizes = getBodySizes(request);
+        if (bodySizes == null)
+            return;
+
+        Iterable<Tag> requestTags = tagsProvider.getTags(request);
+        DistributionSummary.builder("jetty.server.request.size")
+            .description("Size of HTTP request bodies read through the Jetty handler")
+            .baseUnit(BaseUnits.BYTES)
+            .tags(requestTags)
+            .tags(tags)
+            .register(registry)
+            .record((double) bodySizes.requestBytes.get());
+        DistributionSummary.builder("jetty.server.response.size")
+            .description("Size of HTTP response bodies written through the Jetty handler")
+            .baseUnit(BaseUnits.BYTES)
+            .tags(requestTags)
+            .tags(tags)
+            .register(registry)
+            .record((double) bodySizes.responseBytes.get());
+
+        request.removeAttribute(BODY_SIZES_ATTRIBUTE);
+    }
+
+    private @Nullable BodySizes getBodySizes(Request request) {
+        return (BodySizes) request.getAttribute(BODY_SIZES_ATTRIBUTE);
     }
 
     private void beginRequestTiming(Request request) {
@@ -196,6 +282,14 @@ public class TimedHandler extends EventsHandler implements Graceful {
 
     protected Shutdown getShutdown() {
         return shutdown;
+    }
+
+    private static final class BodySizes {
+
+        private final AtomicLong requestBytes = new AtomicLong();
+
+        private final AtomicLong responseBytes = new AtomicLong();
+
     }
 
 }
